@@ -1,6 +1,7 @@
 """
 # WebAPI文档
 
+./runtime/python.exe ./api_v2.py
 ` python api_v2.py -a 127.0.0.1 -p 9880 -c GPT_SoVITS/configs/tts_infer.yaml `
 
 ## 执行参数:
@@ -101,6 +102,10 @@ RESP:
 import os
 import sys
 import traceback
+import requests
+import os
+import uuid
+
 from typing import Generator
 
 now_dir = os.getcwd()
@@ -299,47 +304,63 @@ def check_params(req: dict):
 
     return None
 
-
 async def tts_handle(req: dict):
     """
     Text to speech handler.
-
-    Args:
-        req (dict):
-            {
-                "text": "",                   # str.(required) text to be synthesized
-                "text_lang: "",               # str.(required) language of the text to be synthesized
-                "ref_audio_path": "",         # str.(required) reference audio path
-                "aux_ref_audio_paths": [],    # list.(optional) auxiliary reference audio paths for multi-speaker synthesis
-                "prompt_text": "",            # str.(optional) prompt text for the reference audio
-                "prompt_lang": "",            # str.(required) language of the prompt text for the reference audio
-                "top_k": 5,                   # int. top k sampling
-                "top_p": 1,                   # float. top p sampling
-                "temperature": 1,             # float. temperature for sampling
-                "text_split_method": "cut5",  # str. text split method, see text_segmentation_method.py for details.
-                "batch_size": 1,              # int. batch size for inference
-                "batch_threshold": 0.75,      # float. threshold for batch splitting.
-                "split_bucket: True,          # bool. whether to split the batch into multiple buckets.
-                "speed_factor":1.0,           # float. control the speed of the synthesized audio.
-                "fragment_interval":0.3,      # float. to control the interval of the audio fragment.
-                "seed": -1,                   # int. random seed for reproducibility.
-                "media_type": "wav",          # str. media type of the output audio, support "wav", "raw", "ogg", "aac".
-                "streaming_mode": False,      # bool. whether to return a streaming response.
-                "parallel_infer": True,       # bool.(optional) whether to use parallel inference.
-                "repetition_penalty": 1.35    # float.(optional) repetition penalty for T2S model.
-                "sample_steps": 32,           # int. number of sampling steps for VITS model V3.
-                "super_sampling": False,       # bool. whether to use super-sampling for audio when using VITS model V3.
-            }
-    returns:
-        StreamingResponse: audio stream response.
     """
-
     streaming_mode = req.get("streaming_mode", False)
     return_fragment = req.get("return_fragment", False)
     media_type = req.get("media_type", "wav")
 
     check_res = check_params(req)
+    
+    # 1. 初始化路径变量
+    local_path = None
+
+    # 定义一个内部清理函数，避免重复代码
+    def clean_temp_file():
+        if local_path and os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+                print(f"Successfully deleted temporary file: {local_path}")
+            except Exception as delete_e:
+                print(f"Warning: Failed to delete temporary file {local_path}: {delete_e}")
+
+    # ===== 远程音频下载逻辑 =====
+    ref_audio_path = req.get("ref_audio_path", "")
+    if isinstance(ref_audio_path, str) and ref_audio_path.startswith("http"):
+        try:
+            print("Downloading remote ref audio:", ref_audio_path)
+            project_root = os.path.dirname(os.path.abspath(__file__))
+            linshi_dir = os.path.join(project_root, "linshi")
+            os.makedirs(linshi_dir, exist_ok=True)
+
+            file_ext = ref_audio_path.split("?")[0].split(".")[-1]
+            if len(file_ext) > 4:
+                file_ext = "wav"
+            
+            local_filename = f"{uuid.uuid4().hex}.{file_ext}"
+            local_path = os.path.join(linshi_dir, local_filename)
+
+            response = requests.get(ref_audio_path)
+            response.raise_for_status()
+
+            with open(local_path, "wb") as f:
+                f.write(response.content)
+
+            print("Saved remote audio to:", local_path)
+            req["ref_audio_path"] = local_path
+
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content={"message": "Failed to download remote ref audio", "exception": str(e)},
+            )
+    # ===== 结束 =====
+
     if check_res is not None:
+        # 如果参数检查失败，且已经下载了文件，需要删除
+        clean_temp_file()
         return check_res
 
     if streaming_mode or return_fragment:
@@ -349,32 +370,41 @@ async def tts_handle(req: dict):
         tts_generator = tts_pipeline.run(req)
 
         if streaming_mode:
-
+            # --- 流式处理逻辑 ---
             def streaming_generator(tts_generator: Generator, media_type: str):
-                if_frist_chunk = True
-                for sr, chunk in tts_generator:
-                    if if_frist_chunk and media_type == "wav":
-                        yield wave_header_chunk(sample_rate=sr)
-                        media_type = "raw"
-                        if_frist_chunk = False
-                    yield pack_audio(BytesIO(), chunk, sr, media_type).getvalue()
+                try:
+                    if_frist_chunk = True
+                    for sr, chunk in tts_generator:
+                        if if_frist_chunk and media_type == "wav":
+                            yield wave_header_chunk(sample_rate=sr)
+                            media_type = "raw"
+                            if_frist_chunk = False
+                        yield pack_audio(BytesIO(), chunk, sr, media_type).getvalue()
+                finally:
+                    # 关键修改：流播放结束后（或流传输中断后）再删除文件
+                    clean_temp_file()
 
-            # _media_type = f"audio/{media_type}" if not (streaming_mode and media_type in ["wav", "raw"]) else f"audio/x-{media_type}"
             return StreamingResponse(
-                streaming_generator(
-                    tts_generator,
-                    media_type,
-                ),
+                streaming_generator(tts_generator, media_type),
                 media_type=f"audio/{media_type}",
             )
 
         else:
-            sr, audio_data = next(tts_generator)
-            audio_data = pack_audio(BytesIO(), audio_data, sr, media_type).getvalue()
-            return Response(audio_data, media_type=f"audio/{media_type}")
+            # --- 非流式处理逻辑 ---
+            try:
+                sr, audio_data = next(tts_generator)
+                audio_data = pack_audio(BytesIO(), audio_data, sr, media_type).getvalue()
+                return Response(audio_data, media_type=f"audio/{media_type}")
+            finally:
+                # 非流式模式，生成完音频后立即删除
+                clean_temp_file()
+
     except Exception as e:
+        # 如果发生任何未捕获的异常，清理文件并返回错误
+        clean_temp_file()
         return JSONResponse(status_code=400, content={"message": "tts failed", "Exception": str(e)})
 
+    # 注意：这里不需要最外层的 finally 了，因为清理逻辑已经分散到各个生命周期终点去了
 
 @APP.get("/control")
 async def control(command: str = None):
